@@ -1,14 +1,7 @@
 /**
  * TG Direct Downloader — Google Apps Script
- * 
- * Deploy කිරීම:
- *   Extensions → Apps Script → මේ code paste කරන්න
- *   Deploy → New deployment → Web app
- *     Execute as: Me
- *     Who has access: Anyone
- *   Web App URL copy → SHEETS_WEBHOOK_URL env var
  *
- * Sheet columns: unique_id | file_name | file_size | channel_msg_id | chat_id | message_id | big | added_at
+ * Sheet columns: unique_id | file_name | file_size | channel_msg_id | chat_id | message_id | big | added_at | mime_type
  */
 
 const SHEET_NAME = "Files";
@@ -21,10 +14,9 @@ function getOrCreateSheet() {
     sheet.appendRow([
       "unique_id", "file_name", "file_size",
       "channel_msg_id", "chat_id", "message_id",
-      "big", "added_at"
+      "big", "added_at", "mime_type"
     ]);
-    // Header row formatting
-    sheet.getRange(1, 1, 1, 8).setFontWeight("bold").setBackground("#4a86e8").setFontColor("#ffffff");
+    sheet.getRange(1, 1, 1, 9).setFontWeight("bold").setBackground("#4a86e8").setFontColor("#ffffff");
     sheet.setFrozenRows(1);
   }
   return sheet;
@@ -32,27 +24,22 @@ function getOrCreateSheet() {
 
 function doPost(e) {
   try {
-    const data = JSON.parse(e.postData.contents);
+    const data   = JSON.parse(e.postData.contents);
     const action = data.action;
-
-    if (action === "append") {
-      return handleAppend(data);
-    } else if (action === "getAll") {
-      return handleGetAll();
-    } else if (action === "update") {
-      return handleUpdate(data);
-    } else {
-      return jsonResponse({ status: "error", message: "Unknown action: " + action });
-    }
+    if      (action === "append")  return handleAppend(data);
+    else if (action === "getAll")  return handleGetAll();
+    else if (action === "getOne")  return handleGetOne(data);
+    else if (action === "update")  return handleUpdate(data);
+    else return jsonResponse({ status: "error", message: "Unknown action: " + action });
   } catch (err) {
     return jsonResponse({ status: "error", message: err.toString() });
   }
 }
 
-// GET support (for quick testing in browser)
 function doGet(e) {
-  const action = e.parameter.action || "getAll";
+  const action = (e.parameter && e.parameter.action) || "getAll";
   if (action === "getAll") return handleGetAll();
+  if (action === "getOne") return handleGetOne(e.parameter);
   return jsonResponse({ status: "ok", message: "TG Direct Downloader Sheet API" });
 }
 
@@ -66,7 +53,8 @@ function handleAppend(data) {
     data.chat_id        || "",
     data.message_id     || "",
     data.big            || "FALSE",
-    data.added_at       || new Date().toISOString()
+    data.added_at       || new Date().toISOString(),
+    data.mime_type      || ""
   ]);
   return jsonResponse({ status: "ok", action: "append" });
 }
@@ -74,26 +62,37 @@ function handleAppend(data) {
 function handleGetAll() {
   const sheet = getOrCreateSheet();
   const rows  = sheet.getDataRange().getValues();
-  
-  if (rows.length <= 1) {
-    // Only header or empty
-    return jsonResponse({ status: "ok", rows: [] });
-  }
+  if (rows.length <= 1) return jsonResponse({ status: "ok", rows: [] });
 
-  const headers = rows[0];   // ["unique_id", "file_name", ...]
+  const headers = rows[0];
   const result  = [];
-
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
-    if (!row[0]) continue;   // skip empty rows
+    if (!row[0]) continue;
     const obj = {};
-    headers.forEach((h, idx) => {
-      obj[h] = String(row[idx] !== undefined ? row[idx] : "");
-    });
+    headers.forEach((h, idx) => { obj[h] = String(row[idx] !== undefined ? row[idx] : ""); });
     result.push(obj);
   }
-
   return jsonResponse({ status: "ok", rows: result });
+}
+
+// NEW: fetch single row by unique_id — used for lazy cache reload after restart
+function handleGetOne(data) {
+  const uid = data.unique_id;
+  if (!uid) return jsonResponse({ status: "error", message: "unique_id required" });
+
+  const sheet   = getOrCreateSheet();
+  const allData = sheet.getDataRange().getValues();
+  const headers = allData[0];
+
+  for (let i = 1; i < allData.length; i++) {
+    if (String(allData[i][0]) === String(uid)) {
+      const obj = {};
+      headers.forEach((h, idx) => { obj[h] = String(allData[i][idx] !== undefined ? allData[i][idx] : ""); });
+      return jsonResponse({ status: "ok", row: obj });
+    }
+  }
+  return jsonResponse({ status: "not_found", row: null });
 }
 
 function handleUpdate(data) {
@@ -102,17 +101,14 @@ function handleUpdate(data) {
   if (!uid) return jsonResponse({ status: "error", message: "unique_id required" });
 
   const allData = sheet.getDataRange().getValues();
-  
   for (let i = 1; i < allData.length; i++) {
     if (String(allData[i][0]) === String(uid)) {
-      // Column D = index 3 = channel_msg_id
       if (data.channel_msg_id !== undefined) {
         sheet.getRange(i + 1, 4).setValue(data.channel_msg_id);
       }
       return jsonResponse({ status: "ok", action: "update", row: i + 1 });
     }
   }
-
   return jsonResponse({ status: "not_found", unique_id: uid });
 }
 

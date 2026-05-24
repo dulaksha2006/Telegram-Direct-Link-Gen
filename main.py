@@ -1,16 +1,17 @@
-import asyncio, logging, threading
+import asyncio
+import logging
 import uvicorn
-import config, sheets
+import config
+import sheets
 from stream_worker import start_client, stop_client
 from server import app as fastapi_app
 from bot import build_app
 
-logging.basicConfig(format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
 log = logging.getLogger(__name__)
-
-
-def _run_web():
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=config.PORT, log_level="warning", access_log=False)
 
 
 async def main():
@@ -25,18 +26,32 @@ async def main():
         log.error(f"❌ Telethon failed to start: {e}")
         raise
 
-    threading.Thread(target=_run_web, daemon=True).start()
+    # ── Uvicorn — same event loop, no threading ───────────────────
+    # threading.Thread() වලින් uvicorn run කරද්දී uvicorn own loop
+    # create කරනවා → Telethon "event loop must not change" crash.
+    # Fix: uvicorn.Server directly use කරලා current loop share කරනවා.
+    uv_config = uvicorn.Config(
+        fastapi_app,
+        host="0.0.0.0",
+        port=config.PORT,
+        log_level="warning",
+        access_log=False,
+        loop="none",          # ← don't create a new loop
+    )
+    uv_server = uvicorn.Server(uv_config)
+
     log.info(f"✅ Web server on port {config.PORT}")
 
+    # ── PTB bot ───────────────────────────────────────────────────
     ptb = build_app()
     await ptb.initialize()
     await ptb.start()
     await ptb.updater.start_polling(drop_pending_updates=True)
     log.info("✅ Bot polling started")
 
-    stop = asyncio.Event()
+    # ── Run uvicorn + bot on same loop ────────────────────────────
     try:
-        await stop.wait()
+        await uv_server.serve()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:

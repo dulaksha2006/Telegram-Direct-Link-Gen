@@ -62,7 +62,7 @@ p{color:#94a3b8;margin-bottom:20px}
 
 @app.get("/download/{uid}/{filename}")
 async def download(uid: str, filename: str, request: Request):
-    info = sheets.get(uid)
+    info = await sheets.aget(uid)
     if not info:
         raise HTTPException(404, "File not found. Bot restart වෙලා ඇති – නැවත file send කරන්න.")
 
