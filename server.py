@@ -99,42 +99,54 @@ async def download(uid: str, filename: str, request: Request):
     mime    = _mime(display)
     size    = info.get("file_size", 0)
 
+    # ── Range header parsing (for video seekers / download managers) ──
+    range_header = request.headers.get("Range")
+    offset = 0
+    end_b  = size - 1 if size else None
+    status = 200
+
     headers_base = {
         "Content-Disposition": f'attachment; filename="{display}"',
         "Accept-Ranges": "bytes",
     }
-    if size:
-        headers_base["Content-Length"] = str(size)
-
-    # ── Range header parsing (for video seekers / download managers) ──
-    range_header = request.headers.get("Range")
-    offset = 0
-    status = 200
 
     if range_header and size:
         try:
             rng   = range_header.strip().replace("bytes=", "")
-            start, end = rng.split("-")
-            offset = int(start)
-            end_b  = int(end) if end else size - 1
+            start_str, end_str = rng.split("-")
+            offset = int(start_str) if start_str else 0
+            end_b  = int(end_str) if end_str else size - 1
             length = end_b - offset + 1
             headers_base["Content-Range"]  = f"bytes {offset}-{end_b}/{size}"
             headers_base["Content-Length"] = str(length)
             status = 206
         except Exception:
             pass
+    else:
+        # FIX: Always set Content-Length for full file downloads
+        # Without this, some clients (download managers, browsers) 
+        # may show 0B or fail to display file size properly.
+        if size:
+            headers_base["Content-Length"] = str(size)
 
     # ── Choose streaming method ────────────────────────────────────
     if info.get("big") and info.get("chat_id") and info.get("message_id"):
         # MTProto path (Pyrogram) — no size limit
         async def pyro_gen():
-            async for chunk in stream_file(
-                info["chat_id"], info["message_id"], offset=offset
-            ):
-                yield chunk
+            try:
+                async for chunk in stream_file(
+                    info["chat_id"], info["message_id"], offset=offset
+                ):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"Pyrogram stream error: {e}")
 
-        return StreamingResponse(pyro_gen(), status_code=status,
-                                  media_type=mime, headers=headers_base)
+        return StreamingResponse(
+            pyro_gen(),
+            status_code=status,
+            media_type=mime,
+            headers=headers_base,
+        )
     else:
         # Bot API path — ≤ 20 MB
         from telegram import Bot
@@ -144,12 +156,20 @@ async def download(uid: str, filename: str, request: Request):
 
         async def bot_gen():
             async with httpx.AsyncClient(timeout=120) as client:
-                async with client.stream("GET", url) as r:
+                # FIX: Pass Range header to Telegram's CDN if this is a range request
+                req_headers = {}
+                if range_header:
+                    req_headers["Range"] = range_header
+                async with client.stream("GET", url, headers=req_headers) as r:
                     async for chunk in r.aiter_bytes(65536):
                         yield chunk
 
-        return StreamingResponse(bot_gen(), status_code=status,
-                                  media_type=mime, headers=headers_base)
+        return StreamingResponse(
+            bot_gen(),
+            status_code=status,
+            media_type=mime,
+            headers=headers_base,
+        )
 
 
 # ── Health ─────────────────────────────────────────────────────────
