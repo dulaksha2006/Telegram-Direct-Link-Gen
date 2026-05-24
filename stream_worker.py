@@ -1,9 +1,5 @@
 """
 Telegram file streamer using Telethon + raw GetFileRequest.
-Taken from TG-FileStreamBot (EverythingsuckZ/SpringsFern) proven working approach.
-
-Pyrogram's stream_media() has known issues with range requests / partial downloads.
-This uses Telethon's low-level MTProto GetFileRequest directly — no such issues.
 """
 import asyncio
 import copy
@@ -14,7 +10,7 @@ from typing import AsyncGenerator, Optional, Union
 
 from telethon import TelegramClient
 from telethon.crypto import AuthKey
-from telethon.errors import DcIdInvalidError
+from telethon.errors import DcIdInvalidError, ChannelPrivateError, ChatAdminRequiredError
 from telethon.network import MTProtoSender
 from telethon.tl import types
 from telethon.tl.alltlobjects import LAYER
@@ -28,9 +24,8 @@ import config
 
 log = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1024 * 1024  # 1 MB — Telegram's max chunk size
+CHUNK_SIZE = 1024 * 1024  # 1 MB
 
-# ── Telethon client ───────────────────────────────────────────────
 _client: Optional[TelegramClient] = None
 
 
@@ -38,7 +33,7 @@ def get_client() -> TelegramClient:
     global _client
     if _client is None:
         _client = TelegramClient(
-            session=None,         # in-memory session (use string session)
+            session=None,
             api_id=config.API_ID,
             api_hash=config.API_HASH,
         )
@@ -51,7 +46,7 @@ async def start_client() -> None:
         await client.start(bot_token=config.BOT_TOKEN)
         me = await client.get_me()
         log.info(f"Telethon connected as {me.first_name} (bot)")
-        _transfer_cache.clear()
+        _dc_conns.clear()
 
 
 async def stop_client() -> None:
@@ -61,7 +56,6 @@ async def stop_client() -> None:
         _client = None
 
 
-# ── File info ─────────────────────────────────────────────────────
 @dataclass
 class FileInfo:
     file_size: int
@@ -71,20 +65,68 @@ class FileInfo:
     location: Union[types.InputPhotoFileLocation, types.InputDocumentFileLocation]
 
 
-async def get_file_info(chat_id: int, message_id: int) -> Optional[FileInfo]:
+async def _fetch_msg(chat_id: int, message_id: int) -> Optional[Message]:
+    """Fetch a single message with detailed error logging."""
     client = get_client()
     try:
-        msg: Message = await client.get_messages(chat_id, ids=message_id)
+        msg = await client.get_messages(chat_id, ids=message_id)
+        if msg is None:
+            log.warning(
+                f"get_messages returned None — "
+                f"chat_id={chat_id} msg_id={message_id}. "
+                f"Possible causes: bot not in channel, wrong chat_id, message deleted."
+            )
+        elif not msg.media:
+            log.warning(
+                f"Message has no media — "
+                f"chat_id={chat_id} msg_id={message_id} "
+                f"msg_type={type(msg).__name__}"
+            )
+        return msg
+    except (ChannelPrivateError, ChatAdminRequiredError) as e:
+        log.error(
+            f"Bot has no access to chat_id={chat_id}: {e}. "
+            f"Bot must be admin in the storage channel!"
+        )
+        return None
     except Exception as e:
-        log.error(f"get_messages failed chat_id={chat_id} msg_id={message_id}: {e}", exc_info=True)
+        log.error(
+            f"get_messages failed chat_id={chat_id} msg_id={message_id}: {e}",
+            exc_info=True
+        )
         return None
 
+
+async def get_file_info(
+    chat_id: int,
+    message_id: int,
+    fallback_chat_id: Optional[int] = None,
+    fallback_message_id: Optional[int] = None,
+) -> Optional["FileInfo"]:
+    """
+    Try primary (storage channel) first.
+    If it fails, fall back to original chat/message.
+    This prevents "File not accessible" when bot loses access to storage channel.
+    """
+    # ── Primary attempt ───────────────────────────────────────────
+    msg = await _fetch_msg(chat_id, message_id)
+
+    # ── Fallback to original chat ─────────────────────────────────
+    if (not msg or not msg.media) and fallback_chat_id and fallback_message_id:
+        log.info(
+            f"Primary source failed (chat={chat_id}, msg={message_id}), "
+            f"trying fallback (chat={fallback_chat_id}, msg={fallback_message_id})"
+        )
+        msg = await _fetch_msg(fallback_chat_id, fallback_message_id)
+
     if not msg or not msg.media:
-        log.warning(f"No message or no media: chat_id={chat_id} msg_id={message_id}")
+        log.error(
+            f"All sources failed. Primary: chat={chat_id} msg={message_id} | "
+            f"Fallback: chat={fallback_chat_id} msg={fallback_message_id}"
+        )
         return None
 
     try:
-        # BUG FIX #1: get_input_location returns (dc_id, location) tuple — unpack correctly
         dc_id, location = get_input_location(msg.media)
         return FileInfo(
             file_size = msg.file.size or 0,
@@ -94,18 +136,18 @@ async def get_file_info(chat_id: int, message_id: int) -> Optional[FileInfo]:
             location  = location,
         )
     except Exception as e:
-        log.error(f"get_file_info error: {e}", exc_info=True)
+        log.error(f"get_input_location error: {e}", exc_info=True)
         return None
 
 
 # ── DC Connection Manager ─────────────────────────────────────────
 class DCConn:
     def __init__(self, client: TelegramClient, dc_id: int):
-        self.client   = client
-        self.dc_id    = dc_id
-        self.sender:  Optional[MTProtoSender] = None
-        self.auth_key: Optional[AuthKey]      = None
-        self._lock    = asyncio.Lock()
+        self.client    = client
+        self.dc_id     = dc_id
+        self.sender:   Optional[MTProtoSender] = None
+        self.auth_key: Optional[AuthKey]       = None
+        self._lock     = asyncio.Lock()
 
     async def ensure_connected(self) -> MTProtoSender:
         async with self._lock:
@@ -129,7 +171,6 @@ class DCConn:
                     await sender.send(InvokeWithLayerRequest(LAYER, init_req))
                     self.auth_key = sender.auth_key
                 except DcIdInvalidError:
-                    # same DC — reuse session key
                     self.auth_key = self.client.session.auth_key
                     sender.auth_key = self.auth_key
 
@@ -138,7 +179,6 @@ class DCConn:
 
 
 _dc_conns: dict[int, DCConn] = {}
-_transfer_cache: dict[int, "Transferrer"] = {}   # client_id → Transferrer
 
 
 def _get_dc_conn(dc_id: int) -> DCConn:
@@ -153,23 +193,17 @@ async def stream_file(
     from_bytes: int = 0,
     until_bytes: Optional[int] = None,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    Stream file bytes using raw MTProto GetFileRequest.
-    from_bytes / until_bytes are BYTE offsets (inclusive).
-    """
     file_size   = file_info.file_size
     until_bytes = (until_bytes if until_bytes is not None else file_size - 1)
     until_bytes = min(until_bytes, file_size - 1)
 
-    # Align offset down to chunk boundary
     offset         = from_bytes - (from_bytes % CHUNK_SIZE)
-    first_part_cut = from_bytes - offset            # bytes to skip in first chunk
-    last_part_cut  = until_bytes % CHUNK_SIZE + 1   # bytes to keep in last chunk
+    first_part_cut = from_bytes - offset
+    last_part_cut  = until_bytes % CHUNK_SIZE + 1
     first_part     = math.floor(offset / CHUNK_SIZE)
     last_part      = math.ceil(until_bytes / CHUNK_SIZE)
     part_count     = last_part - first_part
 
-    # BUG FIX #2: part_count == 0 edge case — until_bytes < CHUNK_SIZE boundary
     if part_count == 0:
         part_count = 1
 
@@ -201,7 +235,6 @@ async def stream_file(
 
 # ── Forward to storage channel ────────────────────────────────────
 async def forward_to_storage(chat_id: int, message_id: int) -> Optional[int]:
-    """Forward message to STORAGE_CHANNEL. Returns new message_id or None."""
     client = get_client()
     try:
         result = await client.forward_messages(

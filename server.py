@@ -1,6 +1,5 @@
 """
 FastAPI streaming server — Telethon GetFileRequest backend.
-Range requests, video seek, resume download සියල්ල work කරයි.
 """
 import logging
 import mimetypes
@@ -26,7 +25,6 @@ def _mime(filename: str) -> str:
 
 
 def _parse_range(header: str, file_size: int):
-    """Returns (from_bytes, until_bytes, status)"""
     if not header or not file_size:
         return 0, file_size - 1, 200
     m = RANGE_RE.search(header)
@@ -71,7 +69,6 @@ async def download(uid: str, filename: str, request: Request):
     display = unquote(filename)
     size    = info.get("file_size", 0)
 
-    # ── Range header ──────────────────────────────────────────────
     range_hdr             = request.headers.get("Range", "")
     from_b, until_b, status = _parse_range(range_hdr, size)
     content_length        = until_b - from_b + 1 if size else 0
@@ -88,39 +85,62 @@ async def download(uid: str, filename: str, request: Request):
     if status == 206:
         headers["Content-Range"] = f"bytes {from_b}-{until_b}/{size}"
 
-    # ── Decide which message to stream from ──────────────────────
-    # Prefer STORAGE_CHANNEL (persistent across restarts)
+    # ── Source selection ──────────────────────────────────────────
     channel_msg_id = info.get("channel_msg_id")
-    chat_id        = config.STORAGE_CHANNEL if channel_msg_id else info.get("chat_id")
-    message_id     = channel_msg_id if channel_msg_id else info.get("message_id")
+    orig_chat_id   = info.get("chat_id")
+    orig_msg_id    = info.get("message_id")
 
-    if not chat_id or not message_id:
+    # Primary: storage channel. Fallback: original chat.
+    if channel_msg_id:
+        primary_chat = config.STORAGE_CHANNEL
+        primary_msg  = channel_msg_id
+        fallback_chat = orig_chat_id
+        fallback_msg  = orig_msg_id
+    else:
+        primary_chat  = orig_chat_id
+        primary_msg   = orig_msg_id
+        fallback_chat = None
+        fallback_msg  = None
+
+    if not primary_chat or not primary_msg:
         raise HTTPException(500, "Stream source not available.")
 
-    # BUG FIX #3: chat_id must be int for Telethon — sheets.load() saves as int
-    # but channel_msg_id path uses config.STORAGE_CHANNEL which is already int.
-    # Extra guard: cast to int to avoid "peer id invalid" TypeError.
     try:
-        chat_id    = int(chat_id)
-        message_id = int(message_id)
+        primary_chat  = int(primary_chat)
+        primary_msg   = int(primary_msg)
+        fallback_chat = int(fallback_chat) if fallback_chat else None
+        fallback_msg  = int(fallback_msg)  if fallback_msg  else None
     except (TypeError, ValueError) as e:
-        log.error(f"Invalid chat_id/message_id for uid={uid}: {e}")
+        log.error(f"Invalid source ids for uid={uid}: {e}")
         raise HTTPException(500, "Invalid stream source data.")
 
-    # ── Get file location info from Telegram ─────────────────────
-    file_info = await get_file_info(chat_id, message_id)
-    if not file_info:
-        raise HTTPException(404, "File not accessible on Telegram.")
+    # ── Fetch file info (with fallback) ───────────────────────────
+    file_info = await get_file_info(
+        primary_chat, primary_msg,
+        fallback_chat_id=fallback_chat,
+        fallback_message_id=fallback_msg,
+    )
 
-    # BUG FIX #4: file_size=0 files must still stream (e.g. photos reported as 0 by bot API)
-    # Use file_info.file_size as ground truth if sheets recorded 0.
+    if not file_info:
+        log.error(
+            f"File not accessible. uid={uid} "
+            f"primary=({primary_chat},{primary_msg}) "
+            f"fallback=({fallback_chat},{fallback_msg}) "
+            f"cache_info={info}"
+        )
+        raise HTTPException(
+            404,
+            f"File not accessible. Bot storage channel ({config.STORAGE_CHANNEL}) "
+            f"හි bot admin ද? Channel id නිවැරදිද? Logs check කරන්න."
+        )
+
+    # ── Use actual file size if sheets had 0 ──────────────────────
     if not size and file_info.file_size:
-        size             = file_info.file_size
-        from_b, until_b, status = _parse_range(range_hdr, size)
-        content_length   = until_b - from_b + 1
+        size                     = file_info.file_size
+        from_b, until_b, status  = _parse_range(range_hdr, size)
+        content_length           = until_b - from_b + 1
         headers["Content-Length"] = str(content_length)
 
-    # ── Stream ───────────────────────────────────────────────────
     async def generator():
         try:
             async for chunk in stream_file(file_info, from_b, until_b):
