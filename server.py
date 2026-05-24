@@ -25,7 +25,11 @@ def _mime(filename: str) -> str:
 
 
 def _parse_range(header: str, file_size: int):
-    if not header or not file_size:
+    """Parse Range header. Returns (from_b, until_b, status_code)."""
+    if not file_size:
+        # Unknown size — stream from start, let browser figure it out
+        return 0, 0, 200
+    if not header:
         return 0, file_size - 1, 200
     m = RANGE_RE.search(header)
     if not m:
@@ -66,34 +70,19 @@ async def download(uid: str, filename: str, request: Request):
     if not info:
         raise HTTPException(404, "File not found. Bot restart වෙලා ඇති – නැවත file send කරන්න.")
 
-    display = unquote(filename)
-    size    = info.get("file_size", 0)
-
-    range_hdr             = request.headers.get("Range", "")
-    from_b, until_b, status = _parse_range(range_hdr, size)
-    content_length        = until_b - from_b + 1 if size else 0
-
-    mime = info.get("mime_type") or _mime(display)
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{display}"',
-        "Accept-Ranges":       "bytes",
-        "Content-Type":        mime,
-    }
-    if size:
-        headers["Content-Length"] = str(content_length)
-    if status == 206:
-        headers["Content-Range"] = f"bytes {from_b}-{until_b}/{size}"
+    display   = unquote(filename)
+    sheet_size = info.get("file_size", 0)
+    mime      = info.get("mime_type") or _mime(display)
+    range_hdr = request.headers.get("Range", "")
 
     # ── Source selection ──────────────────────────────────────────
     channel_msg_id = info.get("channel_msg_id")
     orig_chat_id   = info.get("chat_id")
     orig_msg_id    = info.get("message_id")
 
-    # Primary: storage channel. Fallback: original chat.
     if channel_msg_id:
-        primary_chat = config.STORAGE_CHANNEL
-        primary_msg  = channel_msg_id
+        primary_chat  = config.STORAGE_CHANNEL
+        primary_msg   = channel_msg_id
         fallback_chat = orig_chat_id
         fallback_msg  = orig_msg_id
     else:
@@ -114,7 +103,7 @@ async def download(uid: str, filename: str, request: Request):
         log.error(f"Invalid source ids for uid={uid}: {e}")
         raise HTTPException(500, "Invalid stream source data.")
 
-    # ── Fetch file info (with fallback) ───────────────────────────
+    # ── Fetch real file info from Telegram (always — for accurate size) ──
     file_info = await get_file_info(
         primary_chat, primary_msg,
         fallback_chat_id=fallback_chat,
@@ -134,16 +123,32 @@ async def download(uid: str, filename: str, request: Request):
             f"හි bot admin ද? Channel id නිවැරදිද? Logs check කරන්න."
         )
 
-    # ── Use actual file size if sheets had 0 ──────────────────────
-    if not size and file_info.file_size:
-        size                     = file_info.file_size
-        from_b, until_b, status  = _parse_range(range_hdr, size)
-        content_length           = until_b - from_b + 1
+    # ── Use Telegram's real size (Sheet may have stored 0 for large files) ──
+    size = file_info.file_size or sheet_size
+
+    # Update cache with real size so future requests skip re-fetch overhead
+    if size and not sheet_size:
+        info["file_size"] = size
+
+    from_b, until_b, status = _parse_range(range_hdr, size)
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{display}"',
+        "Accept-Ranges":       "bytes",
+        "Content-Type":        mime,
+    }
+
+    if size:
+        content_length = until_b - from_b + 1
         headers["Content-Length"] = str(content_length)
+        if status == 206:
+            headers["Content-Range"] = f"bytes {from_b}-{until_b}/{size}"
 
     async def generator():
         try:
-            async for chunk in stream_file(file_info, from_b, until_b):
+            # If size is unknown, stream whole file (until_b=0 guard)
+            end = until_b if size else None
+            async for chunk in stream_file(file_info, from_b, end):
                 yield chunk
         except Exception as e:
             log.error(f"Stream error uid={uid}: {e}", exc_info=True)
