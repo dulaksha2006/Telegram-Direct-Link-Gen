@@ -1,150 +1,71 @@
-# 📡 TG Direct Downloader — MTProto Edition
+# TG Direct Downloader — Restart-Safe Edition
 
-Telegram files **4 GB දක්වා** direct download link ලෙස stream කිරීමට Railway deploy කළ bot.
-
-| Method | Limit | කවදා? |
-|--------|-------|-------|
-| Bot API | 20 MB | ≤ 20 MB files |
-| **MTProto (Pyrogram)** | **4 GB** | **> 20 MB files** |
-
----
-
-## 🗂️ File Structure
-
-```
-tg-dl-v2/
-├── main.py              ← entry point
-├── bot.py               ← Telegram bot handlers
-├── server.py            ← FastAPI (download streaming)
-├── pyro_client.py       ← Pyrogram MTProto client
-├── store.py             ← in-memory file metadata store
-├── config.py            ← env var loader
-├── generate_session.py  ← SESSION_STR generator (run locally)
-├── requirements.txt
-├── railway.toml
-├── Procfile
-└── .gitignore
-```
+## Files
+| File | Description |
+|---|---|
+| `main.py` | Entry point |
+| `bot.py` | Telegram bot handlers |
+| `server.py` | FastAPI streaming server |
+| `pyro_client.py` | Pyrogram MTProto client |
+| `sheets.py` | Google Sheets store (Apps Script) |
+| `config.py` | Environment variables |
+| `appsscript_code.gs` | Google Apps Script code |
 
 ---
 
-## 🚀 Deploy Steps
+## Google Apps Script Setup (1 වතාවක් කරන්න)
 
-### Step 1 — Telegram Bot Token ගන්න
-
-1. [@BotFather](https://t.me/BotFather) open කරන්න
-2. `/newbot` → name + username දෙන්න
-3. **BOT_TOKEN** copy කරගන්න
-
----
-
-### Step 2 — API ID & API Hash ගන්න
-
-1. [my.telegram.org](https://my.telegram.org) → Login (ඔබේ phone number)
-2. **API Development Tools** → App හදන්න (name ඕනෑම දෙයක්)
-3. `api_id` (number) සහ `api_hash` copy කරගන්න
+1. **Google Sheet** create කරන්න (නමක් දෙන්න, e.g. "TG Bot Files")
+2. **Extensions → Apps Script** click කරන්න
+3. `appsscript_code.gs` file එකේ code **paste** කරන්න (default code delete කරලා)
+4. **Save** (Ctrl+S)
+5. **Deploy → New deployment**
+   - Type: **Web app**
+   - Execute as: **Me**
+   - Who has access: **Anyone**
+   - Click **Deploy**
+6. **Web App URL copy** කරන්න → `SHEETS_WEBHOOK_URL` env var
 
 ---
 
-### Step 3 — SESSION_STR Generate කරන්න *(local PC එකේ)*
-
-```bash
-# Python installed නැත්නම් install කරන්න
-pip install pyrogram tgcrypto
-
-# Project folder ඇතුළේ:
-python generate_session.py
-```
-
-- Phone number enter කරන්න (+94xxxxxxxxx)
-- OTP enter කරන්න
-- 2FA password (තිබේ නම්)
-- Terminal එකේ **SESSION_STR** print වෙනවා — copy කරගන්න
-
-> ⚠️ SESSION_STR කාටවත් දෙන්න එපා. ඔබේ account access ලැබේ.
-
----
-
-### Step 4 — GitHub Repo හදන්න
-
-```bash
-git init
-git add .
-git commit -m "initial commit"
-git remote add origin https://github.com/YOUR_NAME/tg-dl-v2.git
-git push -u origin main
-```
-
----
-
-### Step 5 — Railway Deploy
-
-1. [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-2. Repo select කරන්න
-3. **Variables** tab → Add:
-
-| Variable | Value |
-|----------|-------|
-| `BOT_TOKEN` | BotFather token |
-| `API_ID` | my.telegram.org api_id |
-| `API_HASH` | my.telegram.org api_hash |
-| `SESSION_STR` | generate කළ session string |
-| `BASE_URL` | *(deploy පස්සේ add කරන්න)* |
-
-4. Deploy → **Settings → Domains → Generate Domain**
-5. ඒ URL copy කරලා `BASE_URL` variable දාන්න → **Redeploy**
-
----
-
-### Step 6 — Test
-
-- Bot open → `/start`
-- ඕනෑම file send කරන්න (20 MB+ video ත් OK)
-- Direct download link ලැබේ ✅
-
----
-
-## 📋 Environment Variables Reference
+## Environment Variables
 
 | Variable | Required | Description |
-|----------|----------|-------------|
-| `BOT_TOKEN` | ✅ | Telegram Bot token |
-| `API_ID` | ✅ | Telegram API ID |
-| `API_HASH` | ✅ | Telegram API Hash |
+|---|---|---|
+| `BOT_TOKEN` | ✅ | BotFather token |
+| `API_ID` | ✅ | my.telegram.org |
+| `API_HASH` | ✅ | my.telegram.org |
 | `SESSION_STR` | ✅ | Pyrogram string session |
-| `BASE_URL` | ✅ | Railway public URL |
-| `PORT` | ❌ | Auto-set by Railway |
+| `BASE_URL` | ✅ | Server URL (e.g. https://your-app.up.railway.app) |
+| `SHEETS_WEBHOOK_URL` | ✅ | Apps Script Web App URL |
+| `STORAGE_CHANNEL` | ✅ | Channel ID (default: -1003978357179) |
+| `PORT` | ❌ | Server port (default: 8000) |
 
 ---
 
-## 🔧 Troubleshooting
+## SESSION_STR Generate
 
-**Bot respond නොකරයි**
-→ BOT_TOKEN හරිද check කරන්න
-
-**20MB+ files fail වෙනවා**
-→ SESSION_STR හරිද check කරන්න → `/health` endpoint check කරන්න
-
-**"File not found" error**
-→ Bot restart වෙලා ඇති (in-memory store clear වෙනවා)
-→ File නැවත send කරන්න. (Redis add කළොත් persist වෙනවා)
-
-**Railway deploy fail**
-→ requirements.txt check කරන්න → Build logs බලන්න
+```python
+from pyrogram import Client
+app = Client("s", api_id=API_ID, api_hash="API_HASH")
+app.run(app.export_session_string())
+```
 
 ---
 
-## 🛡️ Security Notes
+## How It Works
 
-- `SESSION_STR` — ඔබේ Telegram account access. **GitHub push නොකරන්න.**
-- Railway Variables encrypted ලෙස store වෙනවා.
-- Bot හරහා share කරන links public — sensitive files share නොකරන්න.
+```
+File received
+  → Forward to STORAGE_CHANNEL (permanent Telegram storage)
+  → Save to Google Sheet via Apps Script URL
+  → Reply with direct download link
 
----
+Bot restart
+  → Apps Script getAll → load all rows to memory cache
+  → All links work immediately ✅
 
-## 📈 Upgrade Ideas
-
-- **Redis** — file links persist කරන්න (restart survive)
-- **Auth** — bot allowlist (specific users only)
-- **Expiry links** — time-limited download URLs
-- **Progress** — download progress bot message
+Download request
+  → Read from memory cache
+  → Stream from STORAGE_CHANNEL via Pyrogram
+```

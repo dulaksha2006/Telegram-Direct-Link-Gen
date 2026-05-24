@@ -1,9 +1,10 @@
 """
 Entry point.
-Starts:
-  1. Pyrogram MTProto client
-  2. Uvicorn (FastAPI) in a background thread
-  3. python-telegram-bot polling in the main event loop
+Startup sequence:
+  1. Google Sheets → memory cache load (restart-safe file records)
+  2. Pyrogram MTProto client start
+  3. FastAPI (uvicorn) background thread
+  4. python-telegram-bot polling
 """
 import asyncio
 import logging
@@ -12,6 +13,7 @@ import threading
 import uvicorn
 
 import config
+import sheets
 from pyro_client import start_client, stop_client
 from server import app as fastapi_app
 from bot import build_app
@@ -24,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 def _run_web() -> None:
-    """Run FastAPI in its own thread (blocking)."""
     uvicorn.run(
         fastapi_app,
         host="0.0.0.0",
@@ -35,26 +36,30 @@ def _run_web() -> None:
 
 
 async def main() -> None:
-    # 1. Start Pyrogram
+    # 1. Load Google Sheets → cache
+    logger.info("📊 Loading file records from Google Sheets…")
+    count = await sheets.load()
+    logger.info(f"📊 {count} file records loaded (restart-safe)")
+
+    # 2. Start Pyrogram
     try:
         await start_client()
         logger.info("✅ Pyrogram MTProto client ready")
     except Exception as exc:
-        logger.warning(f"⚠️  Pyrogram not started ({exc}). 20 MB+ downloads disabled.")
+        logger.warning(f"⚠️  Pyrogram not started ({exc}). Large file streaming disabled.")
 
-    # 2. Start FastAPI web server in background thread
+    # 3. FastAPI web server
     web_thread = threading.Thread(target=_run_web, daemon=True)
     web_thread.start()
-    logger.info(f"✅ FastAPI server started on port {config.PORT}")
+    logger.info(f"✅ FastAPI server on port {config.PORT}")
 
-    # 3. Start telegram bot (polling)
+    # 4. Telegram bot polling
     ptb_app = build_app()
     await ptb_app.initialize()
     await ptb_app.start()
     await ptb_app.updater.start_polling(drop_pending_updates=True)
     logger.info("✅ Telegram bot polling started")
 
-    # 4. Block until interrupted
     stop_event = asyncio.Event()
     try:
         await stop_event.wait()

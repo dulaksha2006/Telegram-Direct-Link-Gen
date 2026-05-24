@@ -1,33 +1,59 @@
 """
-FastAPI server
-  GET /                         – landing page
-  GET /download/{uid}/{name}    – stream file (Bot API < 20 MB, Pyrogram ≥ 20 MB)
-  GET /health                   – health check
+FastAPI streaming server.
+  GET /download/{uid}/{filename}  – stream file
+  GET /health                     – health check
+
+Restart-safe: file info Google Sheet එකෙන් load කරනවා.
+Stream logic: FileToLink pattern (chunk_offset/chunk_limit) use කරනවා.
 """
 import logging
 import mimetypes
+import re
 from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
 
-import store
 import config
+import sheets
 from pyro_client import stream_file, get_client
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="TG Direct Downloader", docs_url=None, redoc_url=None)
 
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
-# ── MIME helper ────────────────────────────────────────────────────
 
 def _mime(filename: str) -> str:
     mt, _ = mimetypes.guess_type(filename)
     return mt or "application/octet-stream"
 
 
-# ── Landing page ───────────────────────────────────────────────────
+def _parse_range(range_header: str, file_size: int):
+    """Returns (start, end, status_code)"""
+    if not range_header or not file_size:
+        return 0, file_size - 1 if file_size else 0, 200
+
+    m = RANGE_RE.fullmatch(range_header.strip())
+    if not m:
+        return 0, file_size - 1, 200
+
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s:
+        start = int(start_s)
+        end   = int(end_s) if end_s else file_size - 1
+    else:
+        # suffix range
+        suffix = int(end_s) if end_s else 0
+        start  = max(file_size - suffix, 0)
+        end    = file_size - 1
+
+    if start > end or end >= file_size:
+        return 0, file_size - 1, 200
+
+    return start, end, 206
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -44,24 +70,15 @@ async def home():
        background:radial-gradient(ellipse at 20% 50%,#0d1b2a 0%,#0a0f1e 60%,#060912 100%);
        min-height:100vh;display:flex;align-items:center;justify-content:center;color:#e2e8f0}
   .wrap{max-width:480px;width:90%;text-align:center}
-  .icon{font-size:72px;margin-bottom:28px;display:block;
-        animation:float 3s ease-in-out infinite}
+  .icon{font-size:72px;margin-bottom:28px;display:block;animation:float 3s ease-in-out infinite}
   @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
   h1{font-size:32px;font-weight:700;
      background:linear-gradient(135deg,#60a5fa,#a78bfa);
-     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-     margin-bottom:12px}
+     -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:12px}
   p{color:#94a3b8;line-height:1.7;margin-bottom:32px}
   .badge{display:inline-block;background:rgba(96,165,250,.12);
          border:1px solid rgba(96,165,250,.3);border-radius:8px;
          padding:6px 14px;font-size:13px;color:#60a5fa;margin:4px}
-  .btn{display:inline-block;margin-top:28px;
-       background:linear-gradient(135deg,#3b82f6,#8b5cf6);
-       color:#fff;padding:14px 36px;border-radius:50px;
-       text-decoration:none;font-weight:600;font-size:16px;
-       box-shadow:0 8px 32px rgba(59,130,246,.35);
-       transition:transform .2s,box-shadow .2s}
-  .btn:hover{transform:translateY(-3px);box-shadow:0 12px 40px rgba(59,130,246,.5)}
   .status{margin-top:24px;font-size:13px;color:#475569}
   .dot{display:inline-block;width:8px;height:8px;background:#22c55e;
        border-radius:50%;margin-right:6px;animation:pulse 2s infinite}
@@ -73,106 +90,97 @@ async def home():
   <span class="icon">📡</span>
   <h1>TG Direct Downloader</h1>
   <p>Telegram files instant direct-link ලබා ගන්න.<br>
-     Bot API (20 MB) + MTProto (4 GB) දෙකම support.</p>
+     Bot API (20 MB) + MTProto (4 GB) + Restart-safe Google Sheet backup.</p>
   <div>
     <span class="badge">⚡ Up to 4 GB</span>
     <span class="badge">🔗 Direct links</span>
     <span class="badge">📶 Streaming</span>
-    <span class="badge">⏩ Range requests</span>
+    <span class="badge">💾 Restart-safe</span>
   </div>
-  <a class="btn" href="https://t.me/YourBotUsername">🤖 Bot Open කරන්න</a>
   <div class="status"><span class="dot"></span>Server Online</div>
 </div>
 </body>
 </html>"""
 
 
-# ── Download endpoint ──────────────────────────────────────────────
-
 @app.get("/download/{uid}/{filename}")
 async def download(uid: str, filename: str, request: Request):
-    info = store.get(uid)
+    info = sheets.get(uid)
     if not info:
-        raise HTTPException(404, "File not found – bot restart වෙලා ඇති. නැවත send කරන්න.")
+        raise HTTPException(
+            404,
+            "File not found. Bot restart වෙලා ඇති – නැවත file send කරන්න."
+        )
 
     display = unquote(filename)
     mime    = _mime(display)
     size    = info.get("file_size", 0)
 
-    # ── Range header parsing (for video seekers / download managers) ──
-    range_header = request.headers.get("Range")
-    offset = 0
-    end_b  = size - 1 if size else None
-    status = 200
+    range_header        = request.headers.get("Range", "")
+    start, end, status  = _parse_range(range_header, size)
+    content_length      = end - start + 1 if size else 0
 
-    headers_base = {
+    headers = {
         "Content-Disposition": f'attachment; filename="{display}"',
-        "Accept-Ranges": "bytes",
+        "Accept-Ranges":       "bytes",
+        "Content-Type":        mime,
     }
+    if size:
+        headers["Content-Length"] = str(content_length)
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
 
-    if range_header and size:
-        try:
-            rng   = range_header.strip().replace("bytes=", "")
-            start_str, end_str = rng.split("-")
-            offset = int(start_str) if start_str else 0
-            end_b  = int(end_str) if end_str else size - 1
-            length = end_b - offset + 1
-            headers_base["Content-Range"]  = f"bytes {offset}-{end_b}/{size}"
-            headers_base["Content-Length"] = str(length)
-            status = 206
-        except Exception:
-            pass
-    else:
-        # FIX: Always set Content-Length for full file downloads
-        # Without this, some clients (download managers, browsers) 
-        # may show 0B or fail to display file size properly.
-        if size:
-            headers_base["Content-Length"] = str(size)
+    # ── Streaming source selection ────────────────────────────────
+    # Priority:
+    #   1. STORAGE_CHANNEL forwarded msg  (Pyrogram, restart-safe)
+    #   2. Original chat+msg              (Pyrogram, session-only)
+    #   3. Bot API file_id                (≤20 MB only)
 
-    # ── Choose streaming method ────────────────────────────────────
-    if info.get("big") and info.get("chat_id") and info.get("message_id"):
-        # MTProto path (Pyrogram) — no size limit
+    channel_msg_id = info.get("channel_msg_id")
+    chat_id        = info.get("chat_id")
+    message_id     = info.get("message_id")
+
+    use_pyrogram = info.get("big") or (channel_msg_id is not None)
+    pyro_chat    = config.STORAGE_CHANNEL if channel_msg_id else chat_id
+    pyro_msg     = channel_msg_id if channel_msg_id else message_id
+
+    if use_pyrogram and pyro_chat and pyro_msg:
         async def pyro_gen():
             try:
                 async for chunk in stream_file(
-                    info["chat_id"], info["message_id"], offset=offset
+                    chat_id=pyro_chat,
+                    message_id=pyro_msg,
+                    offset=start,
+                    limit=content_length,
                 ):
                     yield chunk
             except Exception as e:
-                logger.error(f"Pyrogram stream error: {e}")
+                logger.error(f"Pyrogram stream error: {e}", exc_info=True)
 
         return StreamingResponse(
-            pyro_gen(),
-            status_code=status,
-            media_type=mime,
-            headers=headers_base,
+            pyro_gen(), status_code=status, media_type=mime, headers=headers
         )
+
     else:
-        # Bot API path — ≤ 20 MB
+        # Bot API path (≤20 MB, no Pyrogram session or not big)
         from telegram import Bot
-        bot = Bot(token=config.BOT_TOKEN)
+        bot     = Bot(token=config.BOT_TOKEN)
         tg_file = await bot.get_file(info["file_id"])
         url     = tg_file.file_path
 
         async def bot_gen():
+            req_headers = {}
+            if range_header:
+                req_headers["Range"] = range_header
             async with httpx.AsyncClient(timeout=120) as client:
-                # FIX: Pass Range header to Telegram's CDN if this is a range request
-                req_headers = {}
-                if range_header:
-                    req_headers["Range"] = range_header
                 async with client.stream("GET", url, headers=req_headers) as r:
                     async for chunk in r.aiter_bytes(65536):
                         yield chunk
 
         return StreamingResponse(
-            bot_gen(),
-            status_code=status,
-            media_type=mime,
-            headers=headers_base,
+            bot_gen(), status_code=status, media_type=mime, headers=headers
         )
 
-
-# ── Health ─────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -181,4 +189,9 @@ async def health():
         connected = c.is_connected
     except Exception:
         connected = False
-    return {"status": "ok", "pyrogram": connected}
+    cache_size = len(sheets._cache)
+    return {
+        "status":      "ok",
+        "pyrogram":    connected,
+        "cache_files": cache_size,
+    }
