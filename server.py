@@ -72,9 +72,9 @@ async def download(uid: str, filename: str, request: Request):
     size    = info.get("file_size", 0)
 
     # ── Range header ──────────────────────────────────────────────
-    range_hdr          = request.headers.get("Range", "")
+    range_hdr             = request.headers.get("Range", "")
     from_b, until_b, status = _parse_range(range_hdr, size)
-    content_length     = until_b - from_b + 1 if size else 0
+    content_length        = until_b - from_b + 1 if size else 0
 
     mime = info.get("mime_type") or _mime(display)
 
@@ -97,10 +97,28 @@ async def download(uid: str, filename: str, request: Request):
     if not chat_id or not message_id:
         raise HTTPException(500, "Stream source not available.")
 
+    # BUG FIX #3: chat_id must be int for Telethon — sheets.load() saves as int
+    # but channel_msg_id path uses config.STORAGE_CHANNEL which is already int.
+    # Extra guard: cast to int to avoid "peer id invalid" TypeError.
+    try:
+        chat_id    = int(chat_id)
+        message_id = int(message_id)
+    except (TypeError, ValueError) as e:
+        log.error(f"Invalid chat_id/message_id for uid={uid}: {e}")
+        raise HTTPException(500, "Invalid stream source data.")
+
     # ── Get file location info from Telegram ─────────────────────
     file_info = await get_file_info(chat_id, message_id)
     if not file_info:
         raise HTTPException(404, "File not accessible on Telegram.")
+
+    # BUG FIX #4: file_size=0 files must still stream (e.g. photos reported as 0 by bot API)
+    # Use file_info.file_size as ground truth if sheets recorded 0.
+    if not size and file_info.file_size:
+        size             = file_info.file_size
+        from_b, until_b, status = _parse_range(range_hdr, size)
+        content_length   = until_b - from_b + 1
+        headers["Content-Length"] = str(content_length)
 
     # ── Stream ───────────────────────────────────────────────────
     async def generator():

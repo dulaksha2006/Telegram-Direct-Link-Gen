@@ -1,6 +1,6 @@
 """
 Telegram file streamer using Telethon + raw GetFileRequest.
-Taken from TG-FileStreamBot (EverythingSuckz/SpringsFern) proven working approach.
+Taken from TG-FileStreamBot (EverythingsuckZ/SpringsFern) proven working approach.
 
 Pyrogram's stream_media() has known issues with range requests / partial downloads.
 This uses Telethon's low-level MTProto GetFileRequest directly — no such issues.
@@ -73,13 +73,19 @@ class FileInfo:
 
 async def get_file_info(chat_id: int, message_id: int) -> Optional[FileInfo]:
     client = get_client()
-    msg: Message = await client.get_messages(chat_id, ids=message_id)
-    if not msg or not msg.media:
-        return None
     try:
-        media = msg.media
-        file  = getattr(media, "document", None) or getattr(media, "photo", None)
-        dc_id, location = get_input_location(media)
+        msg: Message = await client.get_messages(chat_id, ids=message_id)
+    except Exception as e:
+        log.error(f"get_messages failed chat_id={chat_id} msg_id={message_id}: {e}", exc_info=True)
+        return None
+
+    if not msg or not msg.media:
+        log.warning(f"No message or no media: chat_id={chat_id} msg_id={message_id}")
+        return None
+
+    try:
+        # BUG FIX #1: get_input_location returns (dc_id, location) tuple — unpack correctly
+        dc_id, location = get_input_location(msg.media)
         return FileInfo(
             file_size = msg.file.size or 0,
             mime_type = msg.file.mime_type or "application/octet-stream",
@@ -151,17 +157,21 @@ async def stream_file(
     Stream file bytes using raw MTProto GetFileRequest.
     from_bytes / until_bytes are BYTE offsets (inclusive).
     """
-    file_size  = file_info.file_size
+    file_size   = file_info.file_size
     until_bytes = (until_bytes if until_bytes is not None else file_size - 1)
     until_bytes = min(until_bytes, file_size - 1)
 
     # Align offset down to chunk boundary
-    offset          = from_bytes - (from_bytes % CHUNK_SIZE)
-    first_part_cut  = from_bytes - offset            # bytes to skip in first chunk
-    last_part_cut   = until_bytes % CHUNK_SIZE + 1   # bytes to keep in last chunk
-    first_part      = math.floor(offset / CHUNK_SIZE)
-    last_part       = math.ceil(until_bytes / CHUNK_SIZE)
-    part_count      = last_part - first_part
+    offset         = from_bytes - (from_bytes % CHUNK_SIZE)
+    first_part_cut = from_bytes - offset            # bytes to skip in first chunk
+    last_part_cut  = until_bytes % CHUNK_SIZE + 1   # bytes to keep in last chunk
+    first_part     = math.floor(offset / CHUNK_SIZE)
+    last_part      = math.ceil(until_bytes / CHUNK_SIZE)
+    part_count     = last_part - first_part
+
+    # BUG FIX #2: part_count == 0 edge case — until_bytes < CHUNK_SIZE boundary
+    if part_count == 0:
+        part_count = 1
 
     dc_conn = _get_dc_conn(file_info.dc_id)
     sender  = await dc_conn.ensure_connected()
