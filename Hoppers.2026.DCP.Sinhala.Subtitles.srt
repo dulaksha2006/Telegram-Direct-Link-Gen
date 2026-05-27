@@ -1,13 +1,17 @@
 1
-00:00:00,000 --> 00:00:30,000
-<b><font color="#ff4955">නවතම චිත්‍රපට සහ රූපවාහිනී කතා මාලා</font>
-<font color="#4eff6f"> සිංහල උපසිරුසි සහිතව හෝ රහිතව</font>
-<font color="#5fbdff">බාගත කිරීමට අදම පිවිසෙන්න</font>
-<font color="#fffffe">Movie</font><font color="#ba89ff">Pluz</font><font color="#fffffe">.Com.LK</font></b>
+00:00:00,313 --> 00:00:30,000
+<b><font color="#ff5155" size="30px"><i>Hoppers 2026</i></font>
+
+<font color="#ffc85f">❖ නවතම චිත්‍රපට හා රූපවාහිනී කතාමාලා ❖</font>
+<font color="#fff555">සිංහල උපසිරුසි සහිතව හෝ රහිතව</font>
+<font color="#62c6ff">බාගත කිරීමට හා ඔන්ලයින් බලන්න අදම පිවිසෙන්න</font>
+<font color="#ff4c79">» </font><font color="#ba89ff">Movie</font><font color="#fffffe">Pluz</font><font color="#ba89ff">.Com.LK</font><font color="#ff4c79"> «</font>
+<font color="#00ffcc">✦ Follow </font><font color="#fff555">MTV </font><font color="#ffc85f">Films </font><font color="#00ffcc">& </font><font color="#ba89ff">MoviePluz</font>
+<font color="#00ffcc">Facebook Pages ✦</font></b>
 
 2
 00:00:00,000 --> 01:38:46,960
-{\an1}<b>moviepluz.com.lk</b>
+{\an1}<font color="#fffffe" size="12px"><b>MoviePluz.Com.LK</b></font>
 
 3
 00:01:21,060 --> 00:01:22,060
